@@ -12,14 +12,17 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import time
 from contextlib import contextmanager
-from typing import Any, Iterator, Optional
+from typing import Annotated, Any, Iterator, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
+from pydantic import BaseModel, ConfigDict, Field
 
 from agent.redact import redact_sensitive_text
 from hermes_cli import kanban_db
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_edit
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +96,52 @@ def _client_error(exc: Exception, *, fallback: str, status_code: int = 400) -> H
     detail = message if any(m in message for m in _SAFE_ERROR_MARKERS) else fallback
     log.warning("kanban-rest request rejected (detail=%r): %s", detail, message)
     return HTTPException(status_code=status_code, detail=detail)
+
+
+class _RequestModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class CreateTaskRequest(_RequestModel):
+    title: str = Field(min_length=1, max_length=300)
+    body: Optional[str] = Field(default=None, max_length=100_000)
+    assignee: Optional[str] = Field(default=None, max_length=128)
+    tenant: Optional[str] = Field(default=None, max_length=128)
+    priority: int = Field(default=0, ge=-1_000_000, le=1_000_000)
+    parents: list[str] = Field(default_factory=list, max_length=100)
+    triage: bool = False
+    idempotency_key: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    max_runtime_seconds: Optional[int] = Field(default=None, ge=1, le=31_536_000)
+    skills: Optional[list[str]] = Field(default=None, max_length=50)
+
+
+class UpdateTaskRequest(_RequestModel):
+    title: Optional[str] = Field(default=None, min_length=1, max_length=300)
+    body: Optional[str] = Field(default=None, max_length=100_000)
+    assignee: Optional[str] = Field(default=None, max_length=128)
+    priority: Optional[int] = Field(default=None, ge=-1_000_000, le=1_000_000)
+
+
+class CommentRequest(_RequestModel):
+    body: str = Field(min_length=1, max_length=20_000)
+
+
+class CompleteRequest(_RequestModel):
+    summary: Optional[str] = Field(default=None, max_length=50_000)
+
+
+class BlockRequest(_RequestModel):
+    reason: Optional[str] = Field(default=None, max_length=20_000)
+    kind: Optional[str] = None
+
+
+def _actor(request: Request) -> str:
+    """Durable provenance (comment author, task creator): ``api:`` + the principal the token
+    seam verified, else ``api:external``. Never caller-supplied, and never a valid profile name
+    (the colon): a worker skips comments authored under its own profile name as its own, so an
+    author that could match a profile would silence an operator steer."""
+    principal = getattr(request.state, "token_principal", None)
+    return f"api:{getattr(principal, 'principal', None) or 'external'}"
 
 
 @contextmanager
@@ -196,6 +245,24 @@ def _require_task(conn: sqlite3.Connection, task_id: str) -> Any:
 
 def _task_response(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     return {"task": _task_dto(conn, _require_task(conn, task_id))}
+
+
+def _transition_response(conn: sqlite3.Connection, task_id: str, ok: bool, action: str) -> dict[str, Any]:
+    if not ok:
+        _require_task(conn, task_id)
+        raise HTTPException(status_code=409, detail=f"task cannot be {action} from its current state")
+    return _task_response(conn, task_id)
+
+
+def _idempotency_key(payload_key: Optional[str], header_key: Optional[str]) -> Optional[str]:
+    body = (payload_key or "").strip()
+    header = (header_key or "").strip()
+    if body and header and body != header:
+        raise HTTPException(status_code=409, detail="conflicting idempotency keys")
+    key = header or body or None
+    if key and len(key) > 200:
+        raise HTTPException(status_code=422, detail="idempotency key is too long")
+    return key
 
 
 def _newest_rows(conn: sqlite3.Connection, sql: str, order: str, task_id: str, limit: int) -> list[sqlite3.Row]:
@@ -316,10 +383,166 @@ def list_tasks(
     return {"tasks": items, "count": len(items), "limit": limit, "has_more": has_more}
 
 
+@router.post("/tasks", status_code=201)
+def create_task(
+    payload: CreateTaskRequest,
+    request: Request,
+    response: Response,
+    board: Optional[str] = Query(default=None),
+    idempotency_header: Annotated[Optional[str], Header(alias="Idempotency-Key")] = None,
+) -> dict[str, Any]:
+    key = _idempotency_key(payload.idempotency_key, idempotency_header)
+    with _connection(board) as conn:
+        try:
+            # The storage layer owns idempotency end to end: a repeated key (fast-path hit or a
+            # lost UNIQUE-index race with a concurrent POST) resolves to the live task, created=False.
+            task_id, created = kanban_db.create_task_idempotent(
+                conn,
+                title=payload.title,
+                body=payload.body,
+                assignee=payload.assignee,
+                created_by=_actor(request),
+                workspace_kind="scratch",
+                tenant=payload.tenant,
+                priority=payload.priority,
+                parents=payload.parents,
+                triage=payload.triage,
+                idempotency_key=key,
+                max_runtime_seconds=payload.max_runtime_seconds,
+                skills=payload.skills,
+            )
+        except ValueError as exc:
+            raise _client_error(exc, fallback="task could not be created") from exc
+        if not created:
+            response.status_code = 200
+        return {**_task_response(conn, task_id), "created": created}
+
+
 @router.get("/tasks/{task_id}")
 def get_task(task_id: str, board: Optional[str] = Query(default=None)) -> dict[str, Any]:
     with _connection(board) as conn:
         return _task_response(conn, task_id)
+
+
+@router.patch("/tasks/{task_id}")
+def update_task(task_id: str, payload: UpdateTaskRequest, board: Optional[str] = Query(default=None)) -> dict[str, Any]:
+    fields = payload.model_fields_set
+    if not fields:
+        raise HTTPException(status_code=400, detail="at least one field is required")
+    # ``None`` means "unchanged" to the storage layer, so a null here would answer 200 for nothing.
+    nulls = sorted(name for name in ("priority", "title") if name in fields and getattr(payload, name) is None)
+    if nulls:
+        raise HTTPException(status_code=422, detail=f"{', '.join(nulls)} cannot be null")
+    slug = _resolve_board_slug(board)
+    with _connection(slug) as conn:
+        # One storage-layer transaction for the whole patch: a transition landing mid-request
+        # rolls back every field, so a 409 never leaves the assignee applied while the
+        # title/body edit was refused.
+        try:
+            applied = kanban_db_edit.update_task_fields(
+                conn,
+                task_id,
+                assign="assignee" in fields,
+                assignee=payload.assignee or None,
+                title=payload.title,
+                # An explicit ``"body": null`` clears the body; omitted leaves it.
+                body="" if "body" in fields and payload.body is None else payload.body,
+                priority=payload.priority,
+                board=slug,
+            )
+        except RuntimeError as exc:
+            raise _client_error(exc, fallback="task could not be updated", status_code=409) from exc
+        if not applied:
+            raise HTTPException(status_code=404, detail="task not found")
+        return _task_response(conn, task_id)
+
+
+@router.post("/tasks/{task_id}/comment", status_code=201)
+def comment_task(
+    task_id: str, payload: CommentRequest, request: Request, board: Optional[str] = Query(default=None),
+) -> dict[str, Any]:
+    with _connection(board) as conn:
+        _require_task(conn, task_id)
+        try:
+            comment_id = kanban_db.add_comment(conn, task_id, _actor(request), payload.body)
+        except ValueError as exc:
+            raise _client_error(exc, fallback="comment rejected") from exc
+        row = conn.execute("SELECT created_at FROM task_comments WHERE id = ?", (comment_id,)).fetchone()
+        return {"comment": {"id": comment_id, "task_id": task_id,
+                            "created_at": row["created_at"] if row else int(time.time())}}
+
+
+@router.post("/tasks/{task_id}/complete")
+def complete_task(
+    task_id: str, payload: Optional[CompleteRequest] = None, board: Optional[str] = Query(default=None),
+) -> dict[str, Any]:
+    with _connection(board) as conn:
+        _require_task(conn, task_id)
+        try:
+            ok = kanban_db.complete_task(conn, task_id, summary=payload.summary if payload else None)
+        except ValueError as exc:
+            raise _client_error(exc, fallback="task could not be completed") from exc
+        return _transition_response(conn, task_id, ok, "completed")
+
+
+@router.post("/tasks/{task_id}/block")
+def block_task(
+    task_id: str, payload: Optional[BlockRequest] = None, board: Optional[str] = Query(default=None),
+) -> dict[str, Any]:
+    kind = payload.kind if payload else None
+    # Checked here, not left to block_task: by then the worker below is already stopped.
+    if kind is not None and kind not in kanban_db.VALID_BLOCK_KINDS:
+        raise HTTPException(status_code=400, detail=f"block kind must be one of {sorted(kanban_db.VALID_BLOCK_KINDS)}")
+    with _connection(board) as conn:
+        # A worker blocking its own task exits afterwards; one blocked from outside would keep
+        # running with its claim gone, and an /unblock would start a second worker beside it.
+        # reclaim_task stops it first (SIGTERM, then SIGKILL) and releases the claim.
+        # shortcut: the dispatcher can claim the card again between the reclaim and the block, and
+        # a worker that survives the signals loses its claim anyway; closing both needs block_task
+        # itself to refuse a running card and to stop its worker (a Hermes core change).
+        if _require_task(conn, task_id).status == "running":
+            kanban_db.reclaim_task(conn, task_id, reason="blocked through the Kanban REST API")
+        try:
+            ok = kanban_db.block_task(conn, task_id, reason=payload.reason if payload else None, kind=kind)
+        except ValueError as exc:
+            raise _client_error(exc, fallback="task could not be blocked") from exc
+        return _transition_response(conn, task_id, ok, "blocked")
+
+
+@router.post("/tasks/{task_id}/unblock")
+def unblock_task(task_id: str, board: Optional[str] = Query(default=None)) -> dict[str, Any]:
+    with _connection(board) as conn:
+        _require_task(conn, task_id)
+        return _transition_response(conn, task_id, kanban_db.unblock_task(conn, task_id), "unblocked")
+
+
+@router.post("/tasks/{task_id}/archive")
+def archive_task(task_id: str, board: Optional[str] = Query(default=None)) -> dict[str, Any]:
+    with _connection(board) as conn:
+        _require_task(conn, task_id)
+        return _transition_response(conn, task_id, kanban_db.archive_task(conn, task_id), "archived")
+
+
+@router.post("/tasks/{parent_id}/links/{child_id}")
+def link_tasks(parent_id: str, child_id: str, board: Optional[str] = Query(default=None)) -> dict[str, Any]:
+    with _connection(board) as conn:
+        # A nonexistent parent/child is a 404 (as for unlink), not kanban_db's "unknown task" 400.
+        _require_task(conn, parent_id)
+        _require_task(conn, child_id)
+        try:
+            kanban_db.link_tasks(conn, parent_id, child_id)
+        except ValueError as exc:
+            raise _client_error(exc, fallback="link rejected") from exc
+        return {"parent_id": parent_id, "child_id": child_id, "linked": True}
+
+
+@router.delete("/tasks/{parent_id}/links/{child_id}")
+def unlink_tasks(parent_id: str, child_id: str, board: Optional[str] = Query(default=None)) -> dict[str, Any]:
+    with _connection(board) as conn:
+        _require_task(conn, parent_id)
+        _require_task(conn, child_id)
+        removed = kanban_db.unlink_tasks(conn, parent_id, child_id)
+        return {"parent_id": parent_id, "child_id": child_id, "removed": removed}
 
 
 @router.get("/tasks/{task_id}/events")
