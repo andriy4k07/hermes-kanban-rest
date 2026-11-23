@@ -4,7 +4,8 @@ The dashboard mounts this router at ``/api/plugins/kanban-rest/``; every route l
 ``/v1``. It reads and writes through the same ``hermes_cli.kanban_db`` functions as the CLI,
 dashboard, tools and dispatcher, and exposes workflow/task concepts rather than SQLite rows:
 private task bodies, results, comments, workspace paths, claims, process data, profile internals
-and raw event payloads are never serialized.
+and raw event payloads are never serialized. The one exception, the run transcript, is off unless
+the ``expose_transcripts`` setting is on.
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
+from itertools import takewhile
+from pathlib import Path
 from typing import Annotated, Any, Iterator, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
@@ -23,12 +26,19 @@ from agent.redact import redact_sensitive_text
 from hermes_cli import kanban_db
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_edit
+from hermes_cli.kanban_db_dispatch import TERMINAL_WORKER_REAP_GRACE_SECONDS as _RUN_TRANSCRIPT_GRACE_SECONDS
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1")
 
 _API_VERSION = "1"
+# The plugin's registry id: its settings (``plugins.entries.<id>``) and run links are keyed by it.
+_PLUGIN_ID = "kanban-rest"
+# Transcript field caps: tool results can be whole file or database dumps, so they get a tighter
+# limit than the agent's own prose and reasoning.
+_TRANSCRIPT_TEXT_CAP = 20_000
+_TRANSCRIPT_TOOL_CAP = 4_000
 _DEFAULT_LOG_TAIL = 8_192
 _MAX_LOG_TAIL = 32_768
 # Read this much before the requested tail so redaction sees where a secret starts (a PEM
@@ -317,7 +327,8 @@ def capabilities() -> dict[str, Any]:
         "tasks": {"read": True, "create": True, "update": True},
         "actions": ["comment", "complete", "block", "unblock", "archive"],
         "links": {"create": True, "delete": True},
-        "observability": ["events", "runs", "sanitized_log_excerpt"],
+        "observability": ["events", "runs", "sanitized_log_excerpt"]
+        + (["transcript"] if _expose_transcripts() else []),
         "task_statuses": sorted(kanban_db.VALID_STATUSES),
         "block_kinds": sorted(kanban_db.VALID_BLOCK_KINDS),
         "idempotent_task_creation": True,
@@ -607,4 +618,192 @@ def task_log(
         "tail_bytes": tail_bytes,
         "truncated": size > tail_bytes,
         "excerpt": _sanitize_log(content or "").encode()[-tail_bytes:].decode(errors="ignore"),
+    }
+
+
+def _expose_transcripts() -> bool:
+    """The active profile scope's opt-in: transcripts carry the task body and worker output that
+    the rest of ``/v1`` withholds."""
+    from hermes_cli.config import cfg_get, load_config_readonly
+
+    settings = cfg_get(load_config_readonly(), "plugins", "entries", _PLUGIN_ID, "settings", default={})
+    return isinstance(settings, dict) and settings.get("expose_transcripts") is True
+
+
+def _worker_session(run: Any, board: str) -> tuple[Optional[Path], Optional[str]]:
+    """``(worker profile home, session id)`` for ``run``, both read as the profile that ran it,
+    never the task's assignee (PATCH can repoint that) nor the request's ``?profile=``. The home
+    is None when that profile has not opted in; the session is None until its worker linked one
+    (``run_link_key`` in the plugin's ``__init__.py``)."""
+    from hermes_cli.plugins_state import PluginState
+    from hermes_cli.profiles import resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    try:
+        home = Path(resolve_profile_env(run.profile or "default"))
+    except (FileNotFoundError, ValueError):
+        return None, None
+    token = set_hermes_home_override(home)
+    try:
+        if not _expose_transcripts():
+            return None, None
+        link = PluginState(_PLUGIN_ID).get(f"run.{board}.{run.id}")
+    finally:
+        reset_hermes_home_override(token)
+    return home, link.get("session") if isinstance(link, dict) and link.get("task") == run.task_id else None
+
+
+def _transcript_text(value: Any, cap: int) -> tuple[Optional[str], bool]:
+    """Sanitize + cap one transcript field; multimodal parts keep text only."""
+    if value is None:
+        return None, False
+    if isinstance(value, list):
+        value = "\n".join(str(part.get("text") or "") for part in value if isinstance(part, dict))
+    text = _sanitize_log(str(value))
+    if not text:
+        return None, False
+    if len(text) > cap:
+        return text[:cap], True
+    return text, False
+
+
+def _transcript_tool_call(raw: Any) -> tuple[dict[str, Any], bool]:
+    raw = raw if isinstance(raw, dict) else {}
+    fn = raw.get("function") if isinstance(raw.get("function"), dict) else raw
+    arguments, truncated = _transcript_text(fn.get("arguments"), _TRANSCRIPT_TOOL_CAP)
+    return {"id": _sanitize_log(str(raw.get("id") or "")), "name": _sanitize_log(str(fn.get("name") or "")),
+            "arguments": arguments or ""}, truncated
+
+
+def _transcript_message(msg: dict[str, Any]) -> dict[str, Any]:
+    role = msg.get("role")
+    content, truncated = _transcript_text(
+        msg.get("content"), _TRANSCRIPT_TOOL_CAP if role == "tool" else _TRANSCRIPT_TEXT_CAP)
+    reasoning, cut = _transcript_text(msg.get("reasoning") or msg.get("reasoning_content"), _TRANSCRIPT_TEXT_CAP)
+    truncated = truncated or cut
+    tool_calls = []
+    for raw in msg.get("tool_calls") or []:
+        call, cut = _transcript_tool_call(raw)
+        tool_calls.append(call)
+        truncated = truncated or cut
+    return {
+        "id": msg["id"],
+        # Compaction re-inserts the steps it carries forward under fresh ids; the uid survives,
+        # so a poller can drop a step it already has.
+        "uid": msg.get("message_uid"),
+        "role": role,
+        "content": content,
+        "reasoning": reasoning,
+        "tool_calls": tool_calls,
+        "tool_name": _transcript_text(msg.get("tool_name"), _TRANSCRIPT_TOOL_CAP)[0],
+        "tool_call_id": _transcript_text(msg.get("tool_call_id"), _TRANSCRIPT_TOOL_CAP)[0],
+        "timestamp": msg.get("timestamp"),
+        "truncated": truncated,
+    }
+
+
+def _read_session_messages(
+    home: Path, session_id: str, after_id: int, limit: int, latest: bool, until: Optional[float],
+) -> list[dict[str, Any]]:
+    """Rows of a worker session and its compression continuations, from the worker profile's
+    own store. Message ids are one sequence per store, so ``after_id`` is a cursor across the
+    whole chain. ``latest``: the newest ``limit`` rows (still oldest-first). ``until``: nothing
+    written after that time. Every visibility is read: in-place compaction soft-archives the steps
+    it summarized and those are still the run's history; the caller drops rewound rows."""
+    from persistence.conversation.messages import TranscriptRead, TranscriptView
+    from persistence_assembly import open_persistence_reader
+
+    db_path = home / "state.db"
+    if not db_path.is_file():
+        return []
+
+    def in_run(row: dict[str, Any]) -> bool:
+        return until is None or (row.get("timestamp") or 0) <= until
+
+    with open_persistence_reader(db_path) as reader:
+        def page(sid: str, **request: Any) -> list[dict[str, Any]]:
+            read = TranscriptRead(view=TranscriptView.ALL, **request)
+            return [row.as_wire_row() for row in reader.messages.read_transcript(sid, read)]
+
+        chain = reader.lineage.chain(session_id) or (session_id,)
+        rows: list[dict[str, Any]] = []
+        if latest:
+            for sid in reversed(chain):
+                want, offset, newest = limit - len(rows), 0, []
+                # A resume after the run appends rows past ``until``: page back over them.
+                while len(newest) < want and (got := page(sid, latest=True, limit=want, offset=offset)):
+                    newest[:0] = [row for row in got if in_run(row)]
+                    offset += len(got)
+                    if until is None:
+                        break
+                rows[:0] = newest[-want:]
+                if len(rows) >= limit:
+                    break
+            return rows
+        for sid in chain:
+            got = page(sid, after_id=after_id, limit=limit - len(rows))
+            kept = list(takewhile(in_run, got))
+            rows.extend(kept)
+            if len(kept) < len(got) or len(rows) >= limit:
+                break  # past the run's end, later segments are later still
+        return rows
+
+
+@router.get("/tasks/{task_id}/transcript")
+def task_transcript(
+    task_id: str,
+    board: Optional[str] = Query(default=None),
+    run_id: Optional[int] = Query(default=None, ge=1),
+    after_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=500),
+    latest: bool = Query(default=False),
+) -> dict[str, Any]:
+    """Step-by-step transcript of one run: reasoning, tool calls/results and replies, sanitized
+    like the log excerpt. Poll with ``after_id`` = ``next_after_id`` while the run is going, or
+    ``latest=true`` for the newest ``limit`` steps (``has_more`` then means older steps exist).
+    404 unless ``expose_transcripts`` is on, in the worker profile's settings too."""
+    if not _expose_transcripts():
+        raise HTTPException(status_code=404, detail="transcripts are disabled")
+    slug = _resolve_board_slug(board)
+    with _connection(slug) as conn:
+        _require_task(conn, task_id)
+        if run_id is None:
+            run = kanban_db.latest_run(conn, task_id)
+        else:
+            run = kanban_db.get_run(conn, run_id)
+            if run is None or run.task_id != task_id:
+                raise HTTPException(status_code=404, detail="run not found")
+    messages: list[dict[str, Any]] = []
+    has_more = False
+    next_after_id = after_id
+    if run is not None:
+        home, session_id = _worker_session(run, slug)
+        if home is None:
+            raise HTTPException(status_code=404, detail="transcripts are disabled")
+        if session_id:
+            # The session outlives the run: ``hermes --resume`` appends to it, and that later
+            # conversation is not this run's. A worker may still write for a moment after its own
+            # transition, and is killed once the reaper's grace has passed.
+            # shortcut: wall-clock bound, so a resume inside the grace window still shows; an exact
+            # one needs the worker to record its last message id when it exits.
+            until = run.ended_at + _RUN_TRANSCRIPT_GRACE_SECONDS if run.ended_at else None
+            try:
+                rows = _read_session_messages(home, session_id, 0 if latest else after_id, limit + 1, latest, until)
+            except Exception as exc:
+                log.warning("kanban-rest transcript read failed for %s: %s", task_id, exc)
+                raise HTTPException(status_code=503, detail="transcript unavailable") from exc
+            has_more = len(rows) > limit
+            page = rows[-limit:] if latest else rows[:limit]
+            # Rewound rows (neither live nor compaction-archived) include the tail a compaction
+            # re-inserts as fresh rows; showing both would repeat it.
+            messages = [_transcript_message(row) for row in page
+                        if row.get("role") != "system" and (row.get("active") or row.get("compacted"))]
+            next_after_id = page[-1]["id"] if page else after_id
+    return {
+        "task_id": task_id,
+        "run_id": run.id if run else None,
+        "run_status": run.status if run else None,
+        "messages": messages,
+        "next_after_id": next_after_id,
+        "has_more": has_more,
     }

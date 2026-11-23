@@ -10,6 +10,8 @@ author: Andriy (andriy4k07)
 license: MIT
 homepage: https://github.com/andriy4k07/hermes-kanban-rest
 tags: [kanban, api, dashboard]
+provides_hooks:
+  - on_session_start
 config_schema:
   secret_env:
     type: str
@@ -26,3 +28,9 @@ config_schema:
     type: int
     default: 43
     description: Shortest secret accepted; secrets.token_urlsafe(32) is exactly 43 characters.
+  expose_transcripts:
+    type: bool
+    default: false
+    description: >-
+      Serve redacted worker transcripts on GET /v1/tasks/{id}/transcript. A run's transcript is
+      served only when the profile that ran the worker has this on (and the serving profile too).

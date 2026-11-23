@@ -45,6 +45,9 @@ class _Ctx:
     def get_config(self, key, default=None):
         return self.settings.get(key, default)
 
+    def register_hook(self, name, callback):
+        self.hooks = {**getattr(self, "hooks", {}), name: callback}
+
     def register_dashboard_auth_provider(self, provider):
         register_provider(provider)
         self.registered.append(provider)

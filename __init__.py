@@ -11,11 +11,16 @@ cannot open theirs. The operator dashboard routes stay on the cookie/session gat
 Naming the variable in ``config.yaml`` is also what keeps the secret out of agent subprocesses:
 Hermes withholds every env name a ``*_secret_env`` setting points at from terminal and tool
 children (``tools.environments.local_env_policy``).
+
+With ``expose_transcripts`` on in a worker profile, an ``on_session_start`` hook records which
+session a dispatcher-spawned worker opened for its run, so ``GET /v1/tasks/{id}/transcript`` can
+serve that run while it is still going.
 """
 from __future__ import annotations
 
 import hmac
 import logging
+import os
 from typing import Optional
 
 from agent.secret_scope import get_secret
@@ -33,6 +38,38 @@ _MIN_DISTINCT_CHARS = 16
 _NOT_INTERACTIVE = "the Kanban REST credential is a non-interactive service credential; there is no login flow"
 
 LAST_SKIP_REASON: str = ""
+
+
+def run_link_key(board: str, run_id: int) -> str:
+    """Plugin-state key of a run's session link (run ids are per board). The transcript endpoint
+    in ``dashboard/plugin_api.py`` reads the same key."""
+    return f"run.{board}.{run_id}"
+
+
+def _link_run_session(ctx, session_id: str) -> None:
+    """Record the session a dispatcher-spawned worker opened for its run, in the worker
+    profile's own plugin state. First writer wins: the worker's main agent starts first, and later
+    agents in the same process (background review, delegated children) must not relabel it."""
+    if ctx.get_config("expose_transcripts", False) is not True:
+        return
+    # The dispatcher pins a worker process's task and run in its environment (identity, not a secret).
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    if not (session_id and task_id and run_id.isdigit()):
+        return
+    from hermes_cli import kanban_db
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    key = run_link_key(kanban_db.get_current_board(), int(run_id))
+    if ctx.state.get(key) is not None:
+        return
+    with connect_closing() as conn:
+        run = kanban_db.get_run(conn, int(run_id))
+    # Only a live attempt of this very task: a stale or hand-set environment must not label another run.
+    if run is None or run.task_id != task_id or run.status != "running":
+        return
+    # shortcut: one small entry per run, never pruned; the 10 MB plugin-state quota holds ~100k runs.
+    ctx.state.set(key, {"task": task_id, "session": session_id})
 
 
 def assess_secret_strength(secret: str, *, min_chars: int = DEFAULT_MIN_SECRET_CHARS) -> Optional[str]:
@@ -111,8 +148,13 @@ def _settings(ctx) -> tuple[Optional[dict], str]:
 
 def register(ctx) -> None:
     """Register the service credential and its token route when a usable secret is configured;
-    otherwise record why not in ``LAST_SKIP_REASON``."""
+    otherwise record why not in ``LAST_SKIP_REASON``. Also hooks session start for transcripts."""
     global LAST_SKIP_REASON
+
+    def on_session_start(session_id: str = "", **_kwargs) -> None:
+        _link_run_session(ctx, session_id)
+
+    ctx.register_hook("on_session_start", on_session_start)
     kwargs, LAST_SKIP_REASON = _settings(ctx)
     if kwargs is None:
         logger.info("kanban-rest: %s", LAST_SKIP_REASON)
