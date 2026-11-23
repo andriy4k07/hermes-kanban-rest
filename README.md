@@ -8,7 +8,8 @@ functions as the CLI, the dashboard, the tools and the dispatcher. It adds no qu
 The API is workflow-oriented and safe by default. Task bodies, results, comment text, workspace
 paths, claim locks, worker PIDs, session IDs, raw event payloads, run metadata/errors/summaries and
 unredacted logs are never returned. The log endpoint returns only a bounded excerpt after Hermes
-secret redaction and absolute-path removal.
+secret redaction and absolute-path removal. The one exception is the
+[run transcript](#run-transcripts-opt-in), which is off unless the operator enables it.
 
 ## Requirements
 
@@ -81,8 +82,8 @@ as a token route demanding that scope:
 - the interactive dashboard, including the bundled Kanban board's routes under
   `/api/plugins/kanban/`, stays on the cookie/session gate.
 
-Within this API the credential is not narrowed further: one secret reads and writes every board.
-Hand it only to a control plane you would trust with the whole Kanban store.
+Within this API the credential is not narrowed further: one secret reads and writes every board,
+and with transcripts enabled it reads the runs of every profile that opted in. Hand it only to a control plane you would trust with the whole Kanban store.
 
 ```bash
 export HERMES_URL="http://127.0.0.1:9119"
@@ -102,7 +103,7 @@ Paths are relative to `/api/plugins/kanban-rest/v1`.
 | Tasks | `GET /tasks`, `POST /tasks`, `GET /tasks/{id}`, `PATCH /tasks/{id}` |
 | Actions | `POST /tasks/{id}/comment`, `/complete`, `/block`, `/unblock`, `/archive` |
 | Dependencies | `POST /tasks/{parent}/links/{child}`, `DELETE /tasks/{parent}/links/{child}` |
-| Observation | `GET /tasks/{id}/events`, `/runs`, `/log` |
+| Observation | `GET /tasks/{id}/events`, `/runs`, `/log`, `/transcript` (opt-in) |
 
 All task endpoints accept `?board=<board-id>`; omit it for the current board. An invalid board id is
 400, an unknown one 404.
@@ -169,6 +170,59 @@ curl -fsS "$API/tasks?board=default&tenant=maintenance" -H "$AUTH" \
 curl -fsS "$API/tasks/$CHILD/events?board=default" -H "$AUTH" | jq
 curl -fsS "$API/tasks/$CHILD/log?board=default&tail_bytes=8192" -H "$AUTH" | jq
 ```
+
+## Run transcripts (opt-in)
+
+`GET /tasks/{id}/transcript` returns a worker's step-by-step session for one run: reasoning, tool
+calls and results, and replies. That includes the task body (the worker's first prompt) and its
+output, so it is **off by default**: the endpoint returns 404 and `GET /capabilities` leaves
+`transcript` out of `observability`. Turn it on per profile:
+
+```yaml
+plugins:
+  entries:
+    kanban-rest:
+      settings:
+        expose_transcripts: true
+```
+
+A transcript is served only when the profile that **ran the worker** has it on, as well as the
+profile serving the API; a `?profile=` on the request does not change whose opt-in counts. With
+workers in named profiles, enable the plugin and the setting in each of them: the worker side of
+the plugin is what records which session a run opened.
+
+When a dispatcher-spawned worker starts its session, the plugin's `on_session_start` hook stores
+the link (task, run, session) in that worker profile's own plugin state. Only a live run of the
+task named by the worker's environment is linked, and the first agent to start wins, so a
+background review or a delegated child in the same worker cannot relabel the run. Runs started
+before the setting was on, or whose worker has not started yet, return an empty `messages` list.
+
+Every text field goes through the same redaction and path removal as the log excerpt. Tool results
+are capped at 4,000 characters and other fields at 20,000 (`truncated: true` marks a cut). System
+messages are never returned, and neither is the worker's session id.
+
+| Query | Default | Meaning |
+|---|---|---|
+| `run_id` | latest run | A run of this task (`GET /tasks/{id}/runs`); a run of another task is 404. |
+| `after_id` | `0` | Return steps after this cursor. Pass the previous `next_after_id` to poll. |
+| `limit` | `200` | Page size, 1-500. |
+| `latest` | `false` | The newest `limit` steps instead (`after_id` is ignored; `has_more` then means older steps exist). |
+
+The transcript is readable while the run is going, and continuations after context compression
+are followed. A finished run's transcript ends with the run: the session can be resumed later
+(`hermes --resume`), and steps written more than two minutes after the run ended are not returned.
+
+```bash
+curl -fsS "$API/tasks/$CHILD/transcript?board=default&after_id=0" -H "$AUTH" \
+  | jq '{run_status, next_after_id, has_more, steps: [.messages[] | {id, role, tool_calls: [.tool_calls[].name], truncated}]}'
+```
+
+Each message carries `id`, `uid`, `role` (`user`, `assistant` or `tool`), `content`, `reasoning`,
+`tool_calls` (`id`, `name`, `arguments`), `tool_name`, `tool_call_id`, `timestamp` and `truncated`,
+wrapped with `task_id`, `run_id`, `run_status`, `next_after_id` and `has_more`. `id` is only the
+paging cursor: when a worker compacts its context mid-run, the steps it carries forward are stored
+again under new ids, so a poller can receive a step it already has. `uid` stays the same, so
+deduplicate on it.
 
 ## Development
 
