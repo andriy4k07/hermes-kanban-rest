@@ -267,6 +267,9 @@ def _transition_response(conn: sqlite3.Connection, task_id: str, ok: bool, actio
 def _idempotency_key(payload_key: Optional[str], header_key: Optional[str]) -> Optional[str]:
     body = (payload_key or "").strip()
     header = (header_key or "").strip()
+    # A key that was sent but is blank must not silently turn retries into duplicate creates.
+    if (payload_key is not None and not body) or (header_key is not None and not header):
+        raise HTTPException(status_code=422, detail="idempotency key is blank")
     if body and header and body != header:
         raise HTTPException(status_code=409, detail="conflicting idempotency keys")
     key = header or body or None

@@ -68,6 +68,13 @@ def test_create_list_get_patch_are_idempotent_and_sanitized(client: TestClient) 
     assert patched.json()["task"]["assignee"] == "worker-one"
 
 
+@pytest.mark.parametrize("where", ["header", "body"])
+def test_blank_idempotency_key_is_refused(client: TestClient, where: str) -> None:
+    kwargs = {"headers": {"Idempotency-Key": "  "}, "json": {"title": "x"}} if where == "header" else {
+        "json": {"title": "x", "idempotency_key": " "}}
+    assert client.post(f"{V1}/tasks", **kwargs).status_code == 422
+
+
 def test_conflicting_idempotency_keys_are_refused(client: TestClient) -> None:
     refused = client.post(f"{V1}/tasks", headers={"Idempotency-Key": "a"},
                           json={"title": "x", "idempotency_key": "b"})
