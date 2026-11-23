@@ -1,0 +1,28 @@
+name: kanban-rest
+version: 0.1.0
+manifest_version: 2
+description: >-
+  Sanitized v1 REST API over the Hermes Kanban store for external control planes, mounted by the
+  dashboard at /api/plugins/kanban-rest/v1. A dedicated bearer service credential, scoped to this
+  surface only, authenticates it; task bodies, results, comments, paths, claims and raw payloads
+  are never returned. Idempotent task creation. Optional per-profile run transcripts (off by default).
+author: Andriy (andriy4k07)
+license: MIT
+homepage: https://github.com/andriy4k07/hermes-kanban-rest
+tags: [kanban, api, dashboard]
+config_schema:
+  secret_env:
+    type: str
+    default: ""
+    description: >-
+      Name of the .env variable that holds the bearer secret (for example KANBAN_REST_API_SECRET).
+      Unset keeps the API on dashboard-session auth. Naming it here also makes Hermes withhold
+      that variable from agent subprocesses.
+  scope:
+    type: str
+    default: kanban
+    description: Scope the service credential carries and the /v1 routes demand.
+  min_secret_chars:
+    type: int
+    default: 43
+    description: Shortest secret accepted; secrets.token_urlsafe(32) is exactly 43 characters.
