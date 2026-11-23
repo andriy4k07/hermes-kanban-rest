@@ -134,16 +134,6 @@ class TestRegister:
         assert unregister_global_provider(name, get_provider(name))
         assert not token_auth.is_token_route(f"{V1}/tasks")
 
-    def test_refused_provider_does_not_rescope_the_route(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv(ENV, _strong())
-        entry.register(_Ctx(secret_env=ENV))
-        assert token_auth._match_token_route(f"{V1}/tasks") == "kanban"
-
-        refused = _Ctx(secret_env=ENV, scope="drain")
-        refused.register_dashboard_auth_provider = lambda provider: None
-        entry.register(refused)
-        assert token_auth._match_token_route(f"{V1}/tasks") == "kanban"
-
 
 @pytest.fixture()
 def gated(monkeypatch: pytest.MonkeyPatch):

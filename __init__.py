@@ -135,7 +135,6 @@ def _settings(ctx) -> tuple[Optional[dict], str]:
     secret = (get_secret(env) or "").strip()
     if not secret:
         return None, f"{env} (named by secret_env) is empty or unset; the Kanban REST credential stays off."
-    scope = str(ctx.get_config("scope", DEFAULT_SCOPE) or "").strip() or DEFAULT_SCOPE
     try:
         min_chars = int(ctx.get_config("min_secret_chars", DEFAULT_MIN_SECRET_CHARS))
     except (TypeError, ValueError):
@@ -143,7 +142,7 @@ def _settings(ctx) -> tuple[Optional[dict], str]:
     reason = assess_secret_strength(secret, min_chars=min_chars)
     if reason is not None:
         return None, f"{env} rejected: {reason}. The Kanban REST credential stays off (fail-closed)."
-    return {"secret": secret, "scope": scope, "min_secret_chars": min_chars}, ""
+    return {"secret": secret, "min_secret_chars": min_chars}, ""
 
 
 def register(ctx) -> None:
@@ -159,11 +158,10 @@ def register(ctx) -> None:
     if kwargs is None:
         logger.info("kanban-rest: %s", LAST_SKIP_REASON)
         return
-    # The context refuses a provider from a profile other than the launch one (None); that
-    # profile's settings must not re-scope the process-global route either.
+    # The context refuses a provider from a profile other than the launch one (None).
     if ctx.register_dashboard_auth_provider(KanbanApiSecretProvider(**kwargs)) is None:
         return
     # ``provider=``: the prefix lapses when the provider is unregistered (plugin disabled), so the
     # surface falls back to session auth instead of answering 401 to everything until restart.
-    register_token_route_prefix(API_PREFIX, scope=kwargs["scope"], provider=KanbanApiSecretProvider.name)
-    logger.info("kanban-rest: service credential registered (scope=%s, prefix=%s)", kwargs["scope"], API_PREFIX)
+    register_token_route_prefix(API_PREFIX, scope=DEFAULT_SCOPE, provider=KanbanApiSecretProvider.name)
+    logger.info("kanban-rest: service credential registered (scope=%s, prefix=%s)", DEFAULT_SCOPE, API_PREFIX)

@@ -20,10 +20,6 @@ config_schema:
       Name of the .env variable that holds the bearer secret (for example KANBAN_REST_API_SECRET).
       Unset keeps the API on dashboard-session auth. Naming it here also makes Hermes withhold
       that variable from agent subprocesses.
-  scope:
-    type: str
-    default: kanban
-    description: Scope the service credential carries and the /v1 routes demand.
   min_secret_chars:
     type: int
     default: 43
