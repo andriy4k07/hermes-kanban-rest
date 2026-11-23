@@ -1,0 +1,186 @@
+# hermes-kanban-rest
+
+A small, authenticated REST API over the [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+Kanban store, for external control planes. It is a Hermes plugin: the dashboard mounts it at
+`/api/plugins/kanban-rest/v1`, and it reads and writes through the same `hermes_cli.kanban_db`
+functions as the CLI, the dashboard, the tools and the dispatcher. It adds no queue and no schema.
+
+The API is workflow-oriented and safe by default. Task bodies, results, comment text, workspace
+paths, claim locks, worker PIDs, session IDs, raw event payloads, run metadata/errors/summaries and
+unredacted logs are never returned. The log endpoint returns only a bounded excerpt after Hermes
+secret redaction and absolute-path removal.
+
+## Requirements
+
+- A Hermes Agent build that includes these changes (none is in a release yet):
+  - [#146551](https://github.com/NousResearch/hermes-agent/pull/146551) scoped token routes
+    (`register_token_route_prefix(..., scope=..., provider=...)`). Without it the plugin fails to
+    load, and `hermes plugins list` shows the import error.
+  - [#146553](https://github.com/NousResearch/hermes-agent/pull/146553) race-safe idempotent
+    creates (`kanban_db.create_task_idempotent`), used by `POST /tasks`.
+  - [#146552](https://github.com/NousResearch/hermes-agent/pull/146552) atomic task edits
+    (`kanban_db_edit.update_task_fields`), used by `PATCH /tasks/{id}`.
+- The default in-process plugin isolation (`plugins.isolation: in_process`). The token route is
+  registered in the process that serves the dashboard, which a hosted plugin process is not.
+
+## Install
+
+```bash
+hermes plugins install https://github.com/andriy4k07/hermes-kanban-rest
+hermes plugins enable kanban-rest
+```
+
+Restart the dashboard (`hermes dashboard`) so it mounts the routes.
+
+## Configure the service credential
+
+Generate a secret with a CSPRNG, store it in the profile's `.env`, and name that variable in the
+plugin's `secret_env` setting:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"   # 256 bits, 43 characters
+echo 'KANBAN_REST_API_SECRET=<the value>' >> ~/.hermes/.env
+hermes plugins config kanban-rest                              # set secret_env: KANBAN_REST_API_SECRET
+```
+
+or directly in `config.yaml`:
+
+```yaml
+plugins:
+  enabled: [kanban-rest]
+  entries:
+    kanban-rest:
+      settings:
+        secret_env: KANBAN_REST_API_SECRET
+        # scope: kanban          # scope the credential carries and /v1 demands
+        # min_secret_chars: 43   # shortest secret accepted
+```
+
+The secret is read through Hermes' credential route (`agent.secret_scope.get_secret`). Naming it in
+`secret_env` also keeps it out of agent subprocesses: Hermes withholds every variable a
+`*_secret_env` setting points at from terminal and tool children and from the persisted terminal
+snapshot. Credentialed CLI children that inherit provider credentials (for example a delegated
+Claude Code or Codex process) are the one exception, as for any other configured API key.
+
+A short or obviously structured secret (under `min_secret_chars`, fewer than 16 distinct
+characters, or one block repeated) is refused at startup and the credential stays off. That check
+only catches degenerate values; it cannot tell how a secret was generated.
+
+## Authentication and scopes
+
+Callers send `Authorization: Bearer <secret>`. The plugin registers a token-only dashboard-auth
+provider whose principal (`kanban-api`) carries the `kanban` scope, and registers the `/v1` prefix
+as a token route demanding that scope:
+
+- a missing or wrong token gets **401**; another service credential (for example the gateway drain
+  secret) authenticates but lacks the scope and gets **403**, and this credential cannot open
+  their routes either;
+- once the credential is active, `/v1` accepts only it, on every bind, loopback included;
+- with `secret_env` unset (or the plugin disabled), `/v1` falls back to dashboard-session auth,
+  which no headless controller can use;
+- the interactive dashboard, including the bundled Kanban board's routes under
+  `/api/plugins/kanban/`, stays on the cookie/session gate.
+
+Within this API the credential is not narrowed further: one secret reads and writes every board.
+Hand it only to a control plane you would trust with the whole Kanban store.
+
+```bash
+export HERMES_URL="http://127.0.0.1:9119"
+export API="$HERMES_URL/api/plugins/kanban-rest/v1"
+export AUTH="Authorization: Bearer $KANBAN_REST_API_SECRET"
+```
+
+## Endpoints
+
+Paths are relative to `/api/plugins/kanban-rest/v1`.
+
+| Area | Endpoints |
+|---|---|
+| Status | `GET /health`, `GET /capabilities` |
+| Boards | `GET /boards`, `GET /boards/{id-or-name}` |
+| Profiles | `GET /profiles` |
+| Tasks | `GET /tasks`, `POST /tasks`, `GET /tasks/{id}`, `PATCH /tasks/{id}` |
+| Actions | `POST /tasks/{id}/comment`, `/complete`, `/block`, `/unblock`, `/archive` |
+| Dependencies | `POST /tasks/{parent}/links/{child}`, `DELETE /tasks/{parent}/links/{child}` |
+| Observation | `GET /tasks/{id}/events`, `/runs`, `/log` |
+
+All task endpoints accept `?board=<board-id>`; omit it for the current board. An invalid board id is
+400, an unknown one 404.
+
+- `GET /tasks` filters on `status`, `assignee`, `tenant`, `include_archived` and `limit` (at most
+  200). There is no cursor: `has_more: true` means more tasks match, so narrow the filters. For
+  totals use the per-status `counts` of `GET /boards`.
+- `GET /profiles` is the assignee roster: `name`, `description` (from `profile.yaml`) and
+  `has_description` only. There is no endpoint that manages or starts a profile: an assigned task
+  becomes eligible through the normal Kanban rules and the gateway's dispatcher launches it.
+- Task payloads carry `created_by` (the profile or surface that created the card) beside
+  `assignee`; each run in `GET /tasks/{id}/runs` names the `profile` that executed it.
+- Cards and comments created through the API are attributed to the verified principal with an
+  `api:` prefix (`api:kanban-api`, or `api:external` with no service token). The caller cannot
+  choose it: a comment with an `author` field is refused with 422. The prefix can never match a
+  profile name, so a worker never mistakes an operator's comment for its own.
+- `PATCH /tasks/{id}` applies all fields in one transaction. `title`/`body` edits on a `done` or
+  `archived` task are refused with 409; `priority` and `assignee` may still change (`assignee` not
+  while running). `null` clears `body` and unassigns `assignee`; `null` for `title` or `priority`
+  is 422.
+- `POST /tasks/{id}/complete` needs evidence: a non-empty `summary` unless the task already has a
+  result, otherwise 400 and the task stays open.
+- `POST /tasks/{id}/block` on a running task first reclaims it (the worker is stopped with SIGTERM,
+  then SIGKILL) so no worker keeps running behind a blocked card.
+- Linking two tasks returns 404 when either does not exist, 400 only for a self-dependency or a
+  cycle.
+- `events` (default 100, at most 500) and `runs` (default 50, at most 200) return the newest
+  entries, oldest first. `log` returns a redacted excerpt of at most `tail_bytes` (default 8192,
+  at most 32768); it never starts mid-line and is cut after redaction.
+- Error details are echoed only when they are known-safe validation messages; anything else is a
+  stable generic message, with the raw error logged server-side.
+
+### Idempotency
+
+`POST /tasks` accepts an `Idempotency-Key` header or an `idempotency_key` field (both set and
+different: 409). Repeating a request with the same key returns the existing live task with
+**200** and `created: false`; a new task is **201** with `created: true`. The key is unique among
+live (non-archived) tasks on the board through a partial `UNIQUE` index, so two concurrent `POST`s
+with one key still resolve to one task. Archiving a task frees its key.
+
+## Example: a parent operation and dependent work
+
+A link means **the parent is a prerequisite for the child**. Declare it in the create request: a
+child created with an assignee and no parents is `ready` at once, so the dispatcher may claim it
+before a later link request arrives, and a running child cannot be linked.
+
+```bash
+PARENT=$(curl -fsS -X POST "$API/tasks?board=default" -H "$AUTH" -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: maintenance-2026-07-10-parent' \
+  -d '{"title": "Approve and fan out maintenance", "tenant": "maintenance", "priority": 20}' | jq -r '.task.id')
+
+CHILD=$(curl -fsS -X POST "$API/tasks?board=default" -H "$AUTH" -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: maintenance-2026-07-10-child-a' \
+  -d '{"title": "Process workstream A", "assignee": "worker-a", "tenant": "maintenance",
+       "parents": ["'"$PARENT"'"]}' | jq -r '.task.id')
+
+# Release the child once the parent's work is done.
+curl -fsS -X POST "$API/tasks/$PARENT/complete?board=default" -H "$AUTH" \
+  -H 'Content-Type: application/json' -d '{"summary": "Scope approved."}'
+
+# Poll state and the sanitized timeline.
+curl -fsS "$API/tasks?board=default&tenant=maintenance" -H "$AUTH" \
+  | jq '.tasks[] | {id, title, status, assignee, created_by, links}'
+curl -fsS "$API/tasks/$CHILD/events?board=default" -H "$AUTH" | jq
+curl -fsS "$API/tasks/$CHILD/log?board=default&tail_bytes=8192" -H "$AUTH" | jq
+```
+
+## Development
+
+The tests run against a real Hermes checkout (with the PRs above) using its environment, each test
+in its own temporary `HOME` and `HERMES_HOME`:
+
+```bash
+HERMES=/path/to/hermes-agent
+PYTHONPATH="$HERMES" "$HERMES/.venv/bin/python" -m pytest
+ruff check .
+```
+
+## License
+
+MIT
