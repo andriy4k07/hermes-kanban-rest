@@ -13,14 +13,19 @@ secret redaction and absolute-path removal. The one exception is the
 
 ## Requirements
 
-- A Hermes Agent build that includes these changes (none is in a release yet):
-  - [#146551](https://github.com/NousResearch/hermes-agent/pull/146551) scoped token routes
+- A Hermes Agent build that includes all three of these changes (none is in a release yet). Each
+  is a hard requirement:
+  - [#159312](https://github.com/NousResearch/hermes-agent/pull/159312) scoped token routes
     (`register_token_route_prefix(..., scope=..., provider=...)`). Without it the plugin fails to
     load, and `hermes plugins list` shows the import error.
-  - [#146553](https://github.com/NousResearch/hermes-agent/pull/146553) race-safe idempotent
-    creates (`kanban_db.create_task_idempotent`), used by `POST /tasks`.
-  - [#146552](https://github.com/NousResearch/hermes-agent/pull/146552) atomic task edits
-    (`kanban_db_edit.update_task_fields`), used by `PATCH /tasks/{id}`.
+  - [#159311](https://github.com/NousResearch/hermes-agent/pull/159311) atomic task edits
+    (`kanban_db_edit.update_task_fields`). Without it the API module fails to import and no `/v1`
+    route is mounted.
+  - [#159310](https://github.com/NousResearch/hermes-agent/pull/159310) race-safe idempotent
+    creates (`kanban_db.create_task_idempotent`). Without it `POST /tasks` fails with 500.
+- The plugin reads the Kanban store through `hermes_cli.kanban_db*` and a few read-only SQL queries
+  of its own. These are not a published plugin API, so a Hermes release can change them; pin the
+  plugin to a Hermes version you have tested.
 - The default in-process plugin isolation (`plugins.isolation: in_process`). The token route is
   registered in the process that serves the dashboard, which a hosted plugin process is not.
 
@@ -53,7 +58,6 @@ plugins:
     kanban-rest:
       settings:
         secret_env: KANBAN_REST_API_SECRET
-        # scope: kanban          # scope the credential carries and /v1 demands
         # min_secret_chars: 43   # shortest secret accepted
 ```
 
@@ -132,7 +136,8 @@ All task endpoints accept `?board=<board-id>`; omit it for the current board. An
   cycle.
 - `events` (default 100, at most 500) and `runs` (default 50, at most 200) return the newest
   entries, oldest first. `log` returns a redacted excerpt of at most `tail_bytes` (default 8192,
-  at most 32768); it never starts mid-line and is cut after redaction.
+  at most 32768). The log is read from a line boundary and cut to `tail_bytes` after redaction, so
+  the excerpt's first line can be partial.
 - Error details are echoed only when they are known-safe validation messages; anything else is a
   stable generic message, with the raw error logged server-side.
 
@@ -142,7 +147,9 @@ All task endpoints accept `?board=<board-id>`; omit it for the current board. An
 different: 409). Repeating a request with the same key returns the existing live task with
 **200** and `created: false`; a new task is **201** with `created: true`. The key is unique among
 live (non-archived) tasks on the board through a partial `UNIQUE` index, so two concurrent `POST`s
-with one key still resolve to one task. Archiving a task frees its key.
+with one key still resolve to one task. Archiving a task frees its key. A repeat is matched by key
+alone: its body is not compared, so a reused key with a different title returns the original task.
+A blank key is refused with 422.
 
 ## Example: a parent operation and dependent work
 
